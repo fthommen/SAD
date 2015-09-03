@@ -1,7 +1,5 @@
 package SAD;
 
-ADDED THIS LINE
-
 #
 # Self defined Ascii Database
 #
@@ -200,7 +198,7 @@ sub new {
       # CONFIG section
       #
       $sect eq "config" && do {
-        ($key, $val) = $_ =~ / *(\w*) *= *(.*) *$/;
+        ($key, $dummy, $val) = $_ =~ / *(\w*)( *= *(.*))? *$/;
         $key = lc($key);
         if (exists $keytrans{$key}) {$key = $keytrans{$key}}
         $val  = dequote ($val);
@@ -307,12 +305,12 @@ sub dequote {
 #
 sub is_multivalue {
   my ($self, $field) = @_;
-  return $self->{'fields'}{$field}{'options'}{'multi'};
+  return $self->has_option($field, "multi");
 }
 
 sub is_required {
   my ($self, $field) = @_;
-  return $self->{'fields'}{$field}{'options'}{'required'};
+  return $self->has_option($field, "required");
 }
 
 sub error_messages {
@@ -363,6 +361,14 @@ sub checkentry {
   if (! $self->{"fields"}{$field}{"index"}) {
     print_error ("[checkentry] No such field \'$field\'.");
     return 0;
+  }
+
+  #
+  # Check for record separator in content
+  #
+  if ($val =~ /.*$self->{"config"}{"recsep"}.*/) {
+    print_error ("[checkentry] Record separator (\"$self->{'config'}{'recsep'}\") is not allowed in field contents (occurred in field \'$field\').");
+    return 0
   }
 
   #
@@ -472,13 +478,13 @@ sub query {
     @qkeys = listkeys($self);
   }
 
-#  print "NO KEYS GIVEN" if !@keys;;
+# print "NO KEYS GIVEN" if !@keys;;
 
   if (!@queries) {
     return @qkeys
   }
 
-#  print "C O N T I N U E\n";
+# print "C O N T I N U E\n";
 
   foreach $k (@qkeys) {        # foreach key
     $found = 0;
@@ -1137,6 +1143,12 @@ sub print_html_table {
 
 
   print "<h1 align=\"center\">$title</h1>\n";
+  if (!$admin && exists $self->{config}->{'adminonly'}) {
+      print "<h2 align=\"center\">Sorry, this database is only accessible for database administrators</h2>\n";
+      return;
+  }
+  
+  
   print "<p>Sorted by $sortkey, Current set: $nr_found entries</p>\n";
   if ($admin) {
     my $url = CGI::url(-path_info => 1);
@@ -1172,7 +1184,7 @@ sub print_html_table {
       print "<td>", CGI::textfield($head, '', 5). "</td>\n";
     }
   }
-  print "<th>", CGI::submit(), "</th>\n";
+  print "<th>", CGI::submit('Search'), "</th>\n";
   print "</tr>\n";
 
   print CGI::end_form();
@@ -1289,7 +1301,8 @@ sub print_edit_form {
       my @valuelist = $self->get_option($field, 'restrict');
       print "  <td>", CGI::popup_menu($field, \@valuelist, $self->$field($key)), "</td>\n";
     } else {
-      print "  <td>", CGI::textfield($field, $self->$field($key)), "</td>\n";
+      # force scalar, otherwise multivalue field will only have the first entry in the form
+      print "  <td>", CGI::textfield($field, scalar($self->$field($key))), "</td>\n";
     }
     print "</tr>\n"
   }
