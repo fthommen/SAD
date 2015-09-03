@@ -1,7 +1,7 @@
 package SAD;
 
 #
-# Self defined Ascii Database
+# Self describing Ascii Database
 #
 # $Source: /local/www/webapps/NMR-booking/RCS/SAD.pm,v $
 # $Id: SAD.pm,v 1.1 2009/06/11 11:18:22 root Exp root $
@@ -25,19 +25,50 @@ package SAD;
 #         {'web'}: Web Settings
 #
 #
+# Database file format:
 #
+#  Section names and key names are case insensitive, values are case sensitive
+#
+# [CONFIG]
+# RECSEP = :
+# NOVAL = '-'
+# 
+# [WEB]
+# title = ACL
+# admin = fthommen,carlomag,stauch,simon
+# 
+# 
+# [FIELDS]
+# 
+# user: REQUIRED,AUTOINDEX
+# acl: REQUIRED,FOREIGN=class@userclasses.db
+# group: FOREIGN=group@groups.db
+# comment
+# TYPE=color
+# UNIQUE
+# 
+# [DATA]
+# alonso:admin:carlomagno:-
+# amata:user:carlomagno:-
+# 
 #
 # Supported field options are:
-#  format=perl_compatible_regexp
-#  required={yes|no}
+#  FORMAT=perl_compatible_regexp
+#  REQUIRED[={yes|no}]
+#  MULTI[={yes|no}]
 #
 =pod
 
 =head1 SAD
 
-This is SAD Doku
+  SAD -- Self describing Ascii Database
+
+=head1 SYNOPSIS
+
+  TBD
 
 =cut
+
 
 #$platform="MACOS";
 $platform="UNIX";
@@ -67,6 +98,33 @@ sub shell {
   }
   print "     B Y E\n"
 }
+
+=head1 USAGE
+=cut
+
+=over 4
+
+=item B<new> (I<filename>[, I<flags>])
+
+Initialize a new database object from file I<filename>.
+
+I<flags> is a comma-separated list of flags.  Possible values for flags are
+
+=over 2
+
+=item *
+
+ro (read-only)
+
+=item *
+
+silent (silent)
+
+=back
+
+=back
+
+=cut
 
 #
 # Initialize a new DB
@@ -107,17 +165,17 @@ sub new {
 
   while (<DB>) {
 
- if ($sect ne "formats") {
+  if ($sect ne "formats") {
     next if /^#/; # && ($sect ne "formats");      # comment lines
     next if /^\s*$/; # && ($sect ne "formats");   # empty lines
-}
-    if (/^\s*\[\s*(\w*)\s*\]\s*$/) {
-      $sect = lc($1);
-      if ((!$supported_sections{$sect}) && $strict) {
-        die "Unknown section \"$sect\"!\n";
-      }
-      next;
+  }
+  if (/^\s*\[\s*(\w*)\s*\]\s*$/) {
+    $sect = lc($1);
+    if ((!$supported_sections{$sect}) && $strict) {
+      die "Unknown section \"$sect\"!\n";
     }
+    next;
+  }
 
     chomp;
 
@@ -201,9 +259,9 @@ sub new {
         ($key, $dummy, $val) = $_ =~ / *(\w*)( *= *(.*))? *$/;
         $key = lc($key);
         if (exists $keytrans{$key}) {$key = $keytrans{$key}}
-        $val  = dequote ($val);
+        $val  = _dequote ($val);
         $self->{'config'}{$key} = $val;
-# print "CONFIG \'$key\' is \'$val\'\n";
+        # print "CONFIG \'$key\' is \'$val\'\n";
         last SECTIONS;
         };
 
@@ -214,7 +272,7 @@ sub new {
         ($key, $val) = $_ =~ / *(\w*) *= *(.*) *$/;
         $key = lc($key);
         if (exists $keytrans{$key}) {$key = $keytrans{$key}}
-        $val  = dequote ($val);
+        $val  = _dequote ($val);
         $self->{'web'}{$key} = $val;
         last SECTIONS;
         };
@@ -291,7 +349,7 @@ sub insert_column {
 #############################################
 
 
-sub dequote {
+sub _dequote {
   my ($val) = @_;
   ($val =~ /^'(.*)'$/) && ($val = $1);
   ($val =~ /^"(.*)"$/) && ($val = $1);
@@ -379,7 +437,7 @@ sub checkentry {
     return 0
   }
   $format && do {
-## print "FORMAT: $format\n";
+    ## print "FORMAT: $format\n";
     if ($val !~ /$format/) {
       print_error ("[checkentry] WRONG FORMAT ($key: $field, $val, $data) [$format].");
       return 0
@@ -409,12 +467,13 @@ sub get {
   }
 }
 
+
 #
 # get_record - return specific record
 #
 sub get_record {
   my ($self, $key) = @_;
-  my %rec = ();
+  my %rec          = ();
 
   foreach  ( keys %{$self->{"fields"}} ) {
     my $index = $self->{"fields"}{$_}{"index"};
@@ -629,7 +688,7 @@ sub listfields {
 
 sub add_record {
   my ($self, $key, %data) = @_;
-  my $autoindex = $self->{"fields"}{$self->{"fieldlist"}[1]}{"options"}{"AUTOINDEX"};
+  my $autoindex = $self->{"fields"}{$self->{"fieldlist"}[1]}{"options"}{"autoindex"};
 #    print_error ("New key is $key, $autoindex, ".$self->{"fieldlist"}[1].", ". $self->{"fields"}{$self->{"fieldlist"}[1]}{"options"}{"AUTOINDEX"});
 #    return 0;
   if ($autoindex) {
@@ -935,12 +994,12 @@ sub commit {
 
   while (<IN>) {
     chomp;
-#    print OUT $_."\n";
+    # print OUT $_."\n";
     /^\s*\[\s*(\w*)\s*\]\s*$/;
     my $sect = lc($1);
     close (IN) if ($sect eq "data");
     if ($rebuild && ($sect eq "fields")) {
-###	@line = $_;
+      ### @line = $_;
       if (/^\s*([\w_]+)\s*(\:\s*(.+))?/) {
         my $field = $1; my $options = $3;
         if ($self->{'fieldlist'}[$f_ind+1] eq $field) {
@@ -1190,9 +1249,9 @@ sub print_html_table {
   print CGI::end_form();
 
   print "<tr><td class=\"noborder\" colspan=\"$tablewidth\">&nbsp;</td></tr>\n";
-#  print "</table>\n";
+  #  print "</table>\n";
 
-#  print "<table border=\"0\">\n";
+  #  print "<table border=\"0\">\n";
   print "<tr>\n  ";
 
 
