@@ -13,6 +13,9 @@ package SAD;
 #
 #  $self->{"fields"}{$field}{"index"}:            Array index of this field within DB
 #                           {"options"}{$option}: Field option
+#                           {$key}{"error"}:            Last error with this field
+#                                                 when opening a database in silent mode
+#                                                 this field will contain errors regarding this specific field
 #         {'fieldlist'}[]:                        Array of field names in correct order
 #         {"nrofields"}:                          No. of fields in DB
 #         {"formats"}{$format}:                   Output format
@@ -26,6 +29,7 @@ package SAD;
 #                   {'fieldsep'}: Separator for multiple value fields [,]
 #                   {'file'}:      Path to the database
 #                   {'ro'}:        read-only
+#         {'errormsgs'}:              Accumulated error messages if run in "silent" mode
 #         {'web'}: Web Settings
 #
 #
@@ -61,7 +65,7 @@ package SAD;
 #  FORMAT=perl_compatible_regexp
 #  REQUIRED[={yes|no}]     (not yet implemented)
 #  MULTI[={yes|no}]
-#  UNIQUE[={yes|no}]  # by default implies REQUIRED=yes
+#  UNIQUE[={yes|no}]  # by default implies REQUIRED=yes unless REQUIRED=0 is explicitely set
 #  SETOF=val1[,val2[...]] (not yet implemented)
 #
 =pod
@@ -77,6 +81,7 @@ package SAD;
 =cut
 
 use strict;
+use vars qw($AUTOLOAD);  # see http://www.perlmonks.org/bare/?node_id=389683
 use Data::Dumper;
 
 #$platform="MACOS";
@@ -88,26 +93,22 @@ my %supported_sections = (fields  => 1,
                           config  => 1);
 
 
-my $strict = 1; # if $strict, then SAD dies at unknown sections
+my $strict = 1;       # if $strict, then SAD dies at unknown sections
 
 my %keytrans = ("field_separator"  => "fieldsep",
                 "record_separator" => "recsep",
-                "noval"            => "noval");
+                "noval"            => "noval",
+                "ro"               => "read-only");
 
-my $silent         = 0;
+# some global settings are used throughout the code and in
+# functions which are not methods of the database object.  I
+# therefore I declare them as "quasi global" variables...
+
+my %mode = ();
+   $mode{"silent"}     = 0;
+   $mode{"permissive"} = 0;
 my $error_messages = '';
 my @locked_files   = ();
-
-
-sub shell {
-  print "THIS IS THE SHELL\n";
-  while (<>) {
-    chomp;
-    print $_, "\n";
-    last if $_ eq 'end';
-  }
-  print "     B Y E\n"
-}
 
 =head1 USAGE
 =cut
@@ -149,19 +150,39 @@ sub new {
   #
   $self->{'config'}{'file'}      = $filename;
   $self->{'config'}{'logfile'}   = $filename.".log";  # Default logfile name
-  $self->{'config'}{'fieldsep'} = ',';                # Default field separator
-  $self->{'config'}{'recsep'} = "\t";                 # Default record separator
-  $self->{'config'}{'noval'} = "-";                   # Replacement for "no data"
-  $self->{'config'}{'ro'} = 0;                        # read-only flag
-  $self->{'config'}{'silent'} = $flags =~ /silent/;   # silent
-   $silent = $self->{'config'}{'silent'};
-  $self->{"nrofields"} = 0;
+  $self->{'config'}{'fieldsep'}  = ',';                # Default field separator
+  $self->{'config'}{'recsep'}    = "\t";                 # Default record separator
+  $self->{'config'}{'noval'}     = "-";                   # Replacement for "no data"
+  $self->{'config'}{'read-only'} = 0;                        # read-only flag
+  $self->{'config'}{'silent'}    = 0;   # silent
+  $self->{"nrofields"}           = 0;
 
-  $self->{'config'}{'ro'} = $flags =~ /ro/;
-  print "DB File is $filename\n";
-  print "FLAGS are $flags\n";
-  print "RO is $self->{'config'}{'ro'}\n";
-  if (!$self->{'config'}{'ro'} && ! lockf_unix ($self->{'config'}{'file'})) {
+  $self->{'errormsgs'}              = '';
+
+  # process loadflags
+  #
+  my %flags = map {$_=>1} split(/ *, */, lc($flags));
+  ## foreach my $k (keys %flags) { print "LOADKEY $k is $flags{$k}\n"; }
+  foreach my $k (keys %flags) {
+    if (exists $keytrans{$k}) { $k = $keytrans{$k} };
+    $self->{'config'}{$k} = 1;
+  }
+  
+  # "silent" will not print out any error messages but store them in
+  # XXX instead
+  $mode{"silent"} = $self->{'config'}{'silent'};
+
+  # "permissive" will not abort if an error occurs
+  $mode{"permissive"} = $self->{'config'}{'permissive'};
+  
+  ## $self->{'config'}{'ro'} = $flags =~ /ro/;
+  ## print "DB File is $filename\n";
+  ## print "FLAGS are $flags\n";
+  ## print "RO is $self->{'config'}{'read-only'}\n";
+
+  ## exit;
+
+  if (!$self->is_readonly() && ! lockf_unix ($self->{'config'}{'file'})) {
     _print_error("Could not lock database \"".$self->{'config'}{'file'}."\"!");
     return undef;
   }
@@ -209,14 +230,17 @@ sub new {
         my @options = split /,/, $options;
 	    ## print "OPTIONS: $options\n" if $3;
         foreach my $opt (@options) {
-	      ## print "OPTION: $opt\n" if $3;
+          next if $opt =~ /^\s*$/;    # empty option
+	      ## print "OPTION: \"$opt\" in field $field\n" if $3;
           $opt =~ /\s*(\w*)\s*(=\s*(.*))?$/;
-          my $val = $3;
+          my $key = lc($1);
+          my $val = lc($3);
 	      ## print "VALUE: $3\n" if $3;
-          if (lc($val) eq "yes") {$val = 1};
-          if (lc($val) eq "no")  {$val = 0};
-          if ($val eq "")        {$val = 1};
-          $self->{"fields"}{$field}{"options"}{lc($1)} = $val;
+          if ($val eq "yes") {$val = 1};
+          if ($val eq "no")  {$val = 0};
+          if ($val eq "")    {$val = 1};
+          $self->{"fields"}{$field}{"options"}{$key} = $val;
+          
 	      # print "SETTING: $field, $1, $val\n";
         }
         $self->{"nrofields"}++;
@@ -245,63 +269,63 @@ sub new {
       # DATA section
       #
       $sect eq "data" && do {
-        my @rec=(""); # prefill array with an empty element
+        my @rec=("");                             # prefill array with an empty element
         my $rsep  = $self->{'config'}{'recsep'};
         my $noval = $self->{'config'}{'noval'};
         # push @rec, split (/\s*$rsep\s*/, $_);
         push @rec, split (/$rsep/, $_);
-        my $key = $rec[1];
+        my $key   = $rec[1];
 
         # check for empty key
         if ($key eq $noval || $key =~ /^\s*$/) {
-          _print_error ("Empty keys are not allowed");
-          _print_error ("  *** RECORD ".join($rsep, @rec)." WILL BE IGNORED ***");
+          $self->_print_error ("Empty keys are not allowed");
+          $self->_print_error ("  *** RECORD ".join($rsep, @rec)." WILL BE IGNORED ***");
+          last SECTIONS;
+        }
+        
+        # check for duplicate keys
+        if (exists $self->{"data"}{$key}) {
+          $self->_print_error ("Duplicate key $key");
+          $self->_print_error ("  Already in database as ".join($rsep, @{$self->{"data"}{$rec[1]}}));
+          $self->_print_error ("  *** IGNORING THIS ENTRY ***");
+          $self->{"fields"}{$key}{$key}{"error"} = "Duplicate key found";
           last SECTIONS;
         }
 
-        # check for duplicate keys
-        if (exists $self->{"data"}{$key}) {
-          _print_error ("Duplicate key $key");
-          _print_error ("  Already in database as ".join($rsep, @{$self->{"data"}{$rec[1]}}));
-          _print_error ("  *** IGNORING THIS ENTRY ***");
-          last SECTIONS;
-        }
-               
         my $nrofrecs = $#rec;
-        # print "NR OF RECORDS: $nrofrecs\n";
         for (my $i=1; $i<= $nrofrecs; $i++) {
           my $field = $self->{"fieldlist"}[$i];
-          print "CHECKING FIELD $field\n";
           $rec[$i]  = "" if $rec[$i] eq $noval;
-          # print "RECORD ITEM Nr $i is $rec[$i]\n";
-          # print "NO VALUE at $i\n" if  $rec[$i] eq $noval;
+
+          my $val   = $rec[$i];                 # use $val from now on for better readability
           
           # check for duplicate values in UNIQUE fields
           if ( $self->has_option($field, "unique") ) {
-            if ( !($rec[$i] eq "" &&
-                   !($self->has_option($field, "required")) )
-               ) {
-              print "NOW CHECKING Field $field FOR DUPLICATES ($key)\n";
-              if ( exists($self->{"index"}{$field}{$rec[$i]}) ) {
-                _print_error ("Duplicate value \"$rec[$i]\" for field \"$field\" in record $rec[1]");
-                my @duprecs = $self->search($field, '^'.$rec[$i].'$');
-                _print_error ("Same value also appears in records \"".join (", ", @duprecs)."\"");
-                _print_error ("*** PLEASE CORRECT MANUALLY ***");
-                abort();
+            if ( !($val eq "" && $self->has_option($field, "skipempty") ) ) {
+              if ( exists($self->{"index"}{$field}{$val}) ) {
+                $self->_print_error ("Duplicate value \"$val\" for field \"$field\" in record $rec[1]");
+                $self->_print_error ("Same value also appears in record \"$self->{'index'}{$field}{$val}\"");
+                $self->_print_error ("*** PLEASE CORRECT MANUALLY ***");
+                $self->{"fields"}{$field}{$key}{"error"} = "Duplicate key found in record \"" . $self->{'index'}{$field}{$val} . "\"";
+                $self->_abort() if not $mode{"permissive"};
               }
-              $self->{"index"}{$field}{$rec[$i]} = 1;  # add entry in index of this field
+              $self->{"index"}{$field}{$val} = $key;  # add entry in index of this field
             }
           }
         }
              
         @{$self->{"data"}{$rec[1]}} = @rec;
+        # foreach my $k (@rec) {
+        #   print "REC: $k\n";
+        # }
+        # print "--------------\n";
         if ($nrofrecs != $self->{"nrofields"}) {
-           _print_error ("Unequal Element number (Record $rec[1]: got " . $#rec . ", expected $self->{nrofields})");
+           $self->_print_error ("Unequal Element number (Record $rec[1]: got " . $#rec . ", expected $self->{nrofields})");
            print "  FIELDS:\n";
            for (my $i=1; $i<= $nrofrecs; $i++) {
              print "   $i ($self->{'fieldlist'}[$i]): $rec[$i]\n";
            }
-           $strict && abort();
+           $strict && _abort();
         }
         # print "\n";
         last SECTIONS;
@@ -339,29 +363,34 @@ sub new {
   return $self;
 }
 
+
+
+#
+# ==========================================================
+#                  Database management
+# ==========================================================
+#
+#
+
 #
 # Switch DB mode ro/rw
 #
 sub switch_mode {
   my ($self, $new_mode) = @_;
-  my $current_mode = 'rw';
-  $current_mode = 'ro' if $self->{'config'}{'ro'};
+  my $current_mode = 'read-write';
+  $current_mode = 'read-only' if $self->{'config'}{'read-only'};
   if ($current_mode eq $new_mode) {return 1};
-  if (($current_mode eq 'ro') && ($new_mode eq 'rw')) {
+  if (($current_mode eq 'read-only') && ($new_mode eq 'read-write')) {
     if (!lockf_unix ($self->{'config'}{'file'})) {
       _print_error('[switch_mode] Database could not be locked');
       return 0
     } else {
-      $self->{'config'}{'ro'} = 0;
+      $self->{'config'}{'read-only'} = 0;
       return 1
     }
   }
 }
 
-
-
-
-#############################################
 
 sub insert_column {
     my ($self, $name, $pos, $options) = @_;
@@ -426,32 +455,16 @@ sub is_required {
   return $self->has_option($field, "required");
 }
 
+sub is_readonly {
+  my ($self) = $_[0];
+  return $self->{'config'}{'read-only'}
+}
+
 sub error_messages {
   return $error_messages
 }
 
 
-sub printdb {
-  my ($self, $key) = @_;
-
-  $| = 1;
-
-  print STDERR "Printing Keys ($key)\n";
-
-  if ($key) {
-    print STDERR $self->{"data"}{$key}[1], "\n";
-  } else {
-    foreach my $k (keys %{$self->{"data"}}) {
-      print STDERR "KEY: $k\n";
-    }
-  }
-
-  print STDERR "Formats\n\n";
-  foreach my $k (keys %{$self->{"format"}}) {
-    print STDERR "**", $k, "**\n";
-    print STDERR $self->{"format"}{$k};
-  }
-}
 
 
 
@@ -463,12 +476,11 @@ sub checkentry {
   #
   # Check if record exists
   #
-  if (! exists $self->{"data"}{$key}) {
-    _print_error ("[checkentry] No such record \'$key\'!");
-    return 0;
-  }
+  # if (! exists $self->{"data"}{$key}) {
+  #   _print_error ("[checkentry] No such record \'$key\'!");
+  #   return 0;
+  # }
 
-  #
   # check if field exists
   #
   if (! $self->{"fields"}{$field}{"index"}) {
@@ -476,15 +488,14 @@ sub checkentry {
     return 0;
   }
 
-  #
   # Check for record separator in content
   #
-  if ($val =~ /.*$self->{"config"}{"recsep"}.*/) {
-    _print_error ("[checkentry] Record separator (\"$self->{'config'}{'recsep'}\") is not allowed in field contents (occurred in field \'$field\').");
+  my $recsep = $self->{"config"}{"recsep"};
+  if ($val =~ /.*$recsep.*/) {
+    _print_error ("[checkentry] Record separator (\"$recsep\") is not allowed in field contents (occurred in field \'$field\').");
     return 0
   }
 
-  #
   # Check options
   #
   if ($required && !$val) {
@@ -502,14 +513,185 @@ sub checkentry {
   return 1;
 }
 
+
+#
+# ==========================================================
+#                  Modify database content
+# ==========================================================
+#
+#
+
+# ugly hack: If set() is called from add_record() then I don't want set() to add the
+#            changes to $self->{"flags"}{$key}{"dirty"}.  Instead add_record() will
+#            document the new entries in $self->{"flags"}{$key}{"added"}.  When
+#            $noSetLog is 1, then set() will skip setting $self->{"flags"}{$key}{"dirty"}
+my $noSetLog = 0;
+
+sub add_record {
+  my ($self, $key, %data) = @_;
+  
+  #  my $autoindex = $self->{"fields"}{$self->{"fieldlist"}[1]}{"options"}{"autoindex"};
+  my $autoindex = $self->has_option($self->{"fieldlist"}[1], "autoindex");
+  #    _print_error ("New key is $key, $autoindex, ".$self->{"fieldlist"}[1].", ". $self->{"fields"}{$self->{"fieldlist"}[1]}{"options"}{"AUTOINDEX"});
+  #    return 0;
+  my @recordstr = ();
+  
+  if ($autoindex) {
+    my @i = sort ({$a <=>$b} $self->listkeys());
+    my $maxindex = $i[$#i] += 1;
+    $key = $maxindex;
+    _print_error ("New key is $key");
+    # return 0;
+  }
+
+  if (!$key) {
+    _print_error ("[add_record] Must define a key for new records!");
+    return 0;
+  }
+
+  # Check if record already exists
+  #
+  if (exists $self->{"data"}{$key}) {
+    _print_error ("[add_record] Record already exists \'$key\'!");
+    return 0;
+  }
+  @{$self->{"data"}{$key}} = ();  # Initialize new record with empty array
+
+
+  # Add datafields and check if record complete, else delete
+  #
+  my $ok       = 1;
+  my $keyfield = $self->{'fieldlist'}[1];
+
+  # key first
+  $noSetLog = 1;
+    $ok = ($self->set($key, $keyfield, $key) && $ok);
+  $noSetLog = 0;
+
+  foreach my $k ($self->listfields()) {
+    next if $keyfield eq $k;  # ignore keyfield overwrites
+    $noSetLog = 1;
+      $ok = ($self->set($key, $k, $data{$k}) && $ok);
+      push (@recordstr, $k."=".$data{$k});
+    $noSetLog = 0;
+  }
+
+  if (! $ok) {
+    _print_error ("[add_record] New record \'$key\' has errors.  IGNORED.");
+    delete ($self->{"data"}{$key});
+    return 0;
+  }
+
+  $self->{"flags"}{$key}{"added"} = join(", ", @recordstr);
+  return 1;
+}
+
+#
+# set: Change a single field in a record
+#
+sub set {
+  my ($self, $key, $field, $val) = @_;
+
+  my $oldval = "";
+  my $i      = "";
+
+  if ($self->is_readonly()) {
+    _print_error ("[set] Cannot change values.  Database $self->{'config'}{'file'} locked\n");
+    return 0;
+  };
+
+  if (!$self->checkentry($key, $field, $val)) {
+    _print_error ("[set] Errors in entry check.  Record \'$key\' unchanged!\n");
+    return 0;
+  };
+
+  $i = $self->{"fields"}{$field}{"index"};
+  $oldval = $self->{"data"}{$key}[$i];      # store old value for log
+  $self->{"data"}{$key}[$i] = $val;         # set new value
+  if (! $noSetLog) {  
+    if ($self->{"flags"}{$key}{"dirty"}) {
+      $self->{"flags"}{$key}{"dirty"} .="; ";
+    }
+    $self->{"flags"}{$key}{"dirty"} .= "$field: $oldval->$val";
+  }
+  return 1;
+}
+
+#
+# add_to: Add a value to a multivalue field
+#
+sub add_to {
+  my ($self, $key, $field, $val) = @_;
+  my $res = 0;
+  my $sep = $self->{'config'}{'fieldsep'};
+
+  if ($self->is_readonly()) {
+    _print_error ("[add_to] Cannot change values.  Database $self->{'config'}{'file'} locked\n");
+    return 0;
+  };
+
+  if (!$self->is_multivalue($field)) {
+    print STDERR "ERROR: Field $field is not multivalued!\n";
+    return 0;
+  }
+
+  if (!$self->contains($key, $field, $val)) {
+    $res = $self->set($key, $field, $self->$field($key).$sep.$val)
+  }
+
+  return $res;
+}
+
+
+sub remove_from {
+  my ($self, $key, $field, $val) = @_;
+  my $res = 0;
+  my $sep = $self->{'config'}{'fieldsep'};
+
+  if ($self->is_readonly()) {
+    _print_error ("Cannot change values.  Database $self->{'config'}{'file'} locked\n");
+    return 0;
+  };
+
+  if (!$self->is_multivalue($field)) {
+    print STDERR "ERROR: Field $field is not multivalued!\n";
+    return 0;
+  }
+
+  my @vals  = $self->get($key, $field);
+  my @vals2 = ();
+  foreach (my $i=0 ; $i<=$#vals ; $i++) {
+    if ($vals[$i] ne $val) {
+      push (@vals2, $vals[$i]);
+    }
+  }
+
+  $res = $self->set($key, $field, join($sep, @vals2));
+
+  return $res;
+}
+
+#
+# ==========================================================
+#                  Retrieve data from database
+# ==========================================================
+#
+#
+
 #
 # get - return single entry from specific record
+#
+#  input:  key, field
+#  output: content of selected field.  If
+#          field is a multivalue field and
+#          result is assigned to array, then
+#          an array of values is returned
 #
 sub get {
   my ($self, $key, $field) = @_;
   # test this for autoviviation!!!
   my $index = $self->{"fields"}{$field}{"index"};
-  my $sep = $self->{'config'}{'fieldsep'};
+  my $sep   = $self->{'config'}{'fieldsep'};
 
   if ( ! exists $self->{"data"}{$key} ) {
        return undef();
@@ -526,6 +708,9 @@ sub get {
 #
 # get_record - return specific record
 #
+#  input:  key
+#  output: hash with selected record
+#
 sub get_record {
   my ($self, $key) = @_;
   my %rec          = ();
@@ -540,6 +725,12 @@ sub get_record {
 }
 
 
+#
+# ==========================================================
+#                  Filter, search and query
+# ==========================================================
+#
+#
 
 sub contains {
   my ($self, $key, $field, $string) = @_;
@@ -568,11 +759,11 @@ sub contains {
 #
 sub query {
   my ($self, $query, @keys) = @_;
-  my @result = ();
-  my @qkeys = ();
+  my @result  = ();
+  my @qkeys   = ();
   my @queries = split /:/, $query;
-  my @query = ();
-  my $found = 0;
+  my @query   = ();
+  my $found   = 0;
 
   #  foreach $k (@queries) {
   #    my @k = split /=/, $k;
@@ -621,190 +812,6 @@ sub query {
   else         {return ()}
 }
 
-
-#
-# set: Change a single field in a record
-#
-sub set {
-  my ($self, $key, $field, $val) = @_;
-
-  if ($self->{'config'}{'ro'}) {
-    _print_error ("[set] Cannot change values.  Database $self->{'config'}{'file'} locked\n");
-    return 0;
-  };
-
-
-  if (!$self->checkentry($key, $field, $val)) {
-    _print_error ("[set] Errors in entry check.  Record \'$key\' unchanged!\n");
-    return 0;
-  };
-
-  $self->{"data"}{$key}[$self->{"fields"}{$field}{"index"}] = $val;
-  if ($self->{"flags"}{$key}{"dirty"}) {
-    $self->{"flags"}{$key}{"dirty"} .=";";
-  }
-  $self->{"flags"}{$key}{"dirty"} .= "$field=$val";
-  return 1;
-}
-
-
-#
-# add_to: Add a value to a multivalue field
-#
-sub add_to {
-  my ($self, $key, $field, $val) = @_;
-  my $res = 0;
-  my $sep = $self->{'config'}{'fieldsep'};
-
-  if ($self->{'config'}{'ro'}) {
-    _print_error ("[add_to] Cannot change values.  Database $self->{'config'}{'file'} locked\n");
-    return 0;
-  };
-
-  if (!$self->is_multivalue($field)) {
-    print STDERR "ERROR: Field $field is not multivalued!\n";
-    return 0;
-  }
-
-  if (!$self->contains($key, $field, $val)) {
-    $res = $self->set($key, $field, $self->$field($key).$sep.$val)
-  }
-
-  return $res;
-}
-
-
-sub remove_from {
-  my ($self, $key, $field, $val) = @_;
-  my $res = 0;
-  my $sep = $self->{'config'}{'fieldsep'};
-
-  if ($self->{'config'}{'ro'}) {
-    _print_error ("Cannot change values.  Database $self->{'config'}{'file'} locked\n");
-    return 0;
-  };
-
-  if (!$self->is_multivalue($field)) {
-    print STDERR "ERROR: Field $field is not multivalued!\n";
-    return 0;
-  }
-
-  my @vals  = $self->get($key, $field);
-  my @vals2 = ();
-  foreach (my $i=0 ; $i<=$#vals ; $i++) {
-    if ($vals[$i] ne $val) {
-      push (@vals2, $vals[$i]);
-    }
-  }
-
-  $res = $self->set($key, $field, join($sep, @vals2));
-
-  return $res;
-}
-
-
-sub record_exists {
-  my ($self, $key) = @_;
-  return exists $self->{'data'}{$key};
-} 
-
-sub field_exists {
-  my ($self, $field) = @_;
-  return exists $self->{'fields'}{$field};
-}
-
-sub has_option {
-  my ($self, $field, $option) = @_;
-  $option = lc($option);
-  
-  # return exists $self->{'fields'}{$field}{'options'}{$option};
-  # be careful not to directly test for $self->{'fields'}{$field}{'options'}{$option}
-  # as this could autovivify $self->{'fields'}{$field} for a not existing $field e.g when
-  # - by error - looping through all indices instead of starting at 1 :-)
-  #
-  # return 1;
-  # print Dumper($self->{'fields'}{$field});
-  if (exists $self->{'fields'}{$field} &&
-      $self->{'fields'}{$field}{'options'}{$option}) {return 1}
-  else                                               {return 0}
-}
-
-
-sub get_option {
-  my ($self, $field, $option) = @_;
-  $option = $self->{'fields'}{$field}{'options'}{lc($option)};
-
-  if (wantarray()) {
-    return split(/\|/, $option)
-  } else {
-    return $option;
-  }
-}
-
-
-sub listfields {
-  my ($self) = @_;
-  my @fieldlist = @{$self->{'fieldlist'}};
-
-  shift @fieldlist;
-  return @fieldlist
-}
-
-
-sub add_record {
-  my ($self, $key, %data) = @_;
-#  my $autoindex = $self->{"fields"}{$self->{"fieldlist"}[1]}{"options"}{"autoindex"};
-  my $autoindex = $self->has_option($self->{"fieldlist"}[1], "autoindex");
-  #    _print_error ("New key is $key, $autoindex, ".$self->{"fieldlist"}[1].", ". $self->{"fields"}{$self->{"fieldlist"}[1]}{"options"}{"AUTOINDEX"});
-  #    return 0;
-  if ($autoindex) {
-    my @i = sort ({$a <=>$b} $self->listkeys());
-    my $maxindex = $i[$#i] += 1;
-    $key = $maxindex;
-    _print_error ("New key is $key");
-    # return 0;
-  }
-
-  if (!$key) {
-    _print_error ("[add_record] Must define a key for new records!");
-    return 0;
-  }
-
-  #
-  # Check if record already exists
-  #
-  if (exists $self->{"data"}{$key}) {
-    _print_error ("[add_record] Record already exists \'$key\'!");
-    return 0;
-  }
-  @{$self->{"data"}{$key}} = ();  # Initialize new record with empty array
-
-
-  #
-  # Add datafields and check if record complete, else delete
-  #
-  my $ok = 1;
-  my $keyfield = $self->{'fieldlist'}[1];
-
-  # key first
-  $ok = $self->set($key, $keyfield, $key) && $ok;
-
-  foreach my $k ($self->listfields()) {
-    next if $keyfield eq $k;  # ignore keyfield overwrites
-    $ok = $self->set($key, $k, $data{$k}) && $ok;
-  }
-
-  if (! $ok) {
-    _print_error ("[add_record] New record \'$key\' has errors.  IGNORED.");
-    delete ($self->{"data"}{$key});
-    return 0;
-  }
-
-  $self->{"flags"}{$key}{"added"} = 1;
-  return 1;
-}
-
-
 #
 # search: returns a list of all keys of records, that match $re in $field
 #
@@ -850,8 +857,56 @@ sub esearch {
 
 
 
+sub record_exists {
+  my ($self, $key) = @_;
+  return exists $self->{'data'}{$key};
+} 
+
+sub field_exists {
+  my ($self, $field) = @_;
+  return exists $self->{'fields'}{$field};
+}
+
+sub has_option {
+  my ($self, $field, $option) = @_;
+  $option = lc($option);
+  
+  # return exists $self->{'fields'}{$field}{'options'}{$option};
+  # be careful not to directly test for $self->{'fields'}{$field}{'options'}{$option}
+  # as this could autovivify $self->{'fields'}{$field} for a not existing $field e.g when
+  # - by error - looping through all indices instead of starting at 1 :-)
+  #
+  # return 1;
+  # print Dumper($self->{'fields'}{$field});
+  if (exists $self->{'fields'}{$field} &&
+      $self->{'fields'}{$field}{'options'}{$option}) {return 1}
+  else                                               {return 0}
+}
+
+
+sub get_option {
+  my ($self, $field, $option) = @_;
+  $option = $self->{'fields'}{$field}{'options'}{lc($option)};
+
+  if (wantarray()) {
+    return split(/\|/, $option)
+  } else {
+    return $option;
+  }
+}
+
+
+sub listfields {
+  my ($self) = @_;
+  my @fieldlist = @{$self->{'fieldlist'}};
+
+  shift  @fieldlist;   # we always start at "1", remember?
+  return @fieldlist
+}
+
+
 #
-# listkeys: Returns a list of all keys within the database
+# listkeys -- Returns a list of all keys within the database
 #
 sub listkeys {
   my ($self) = @_;
@@ -866,7 +921,7 @@ sub listkeys {
 
 
 #
-# listsortedkeys: Returns a sorted list of all keys within the database
+# listkeyssorted -- Returns a sorted list of all keys within the database
 #
 sub listkeyssorted {
   my ($self, $sortfield, $mykeys) = @_;
@@ -887,6 +942,29 @@ sub listkeyssorted {
   return sort { $self->{"data"}{$a}[$self->{"fields"}{$sortfield}{"index"}] cmp $self->{"data"}{$b}[$self->{"fields"}{$sortfield}{"index"}] } @mykeys;
 }
 
+
+sub listfieldvalues {
+  my ($self, $field, $keys, @options) = @_;
+  my %values = ();
+  my @mykeys = ();
+
+  if ($keys) {
+    @mykeys = @$keys
+  } else {
+    @mykeys = keys %{$self->{"data"}}
+  }
+
+  foreach my $k (@mykeys) {
+    my $val = $self->$field($k);
+    $values{$self->$field($k)}=1 if $val
+  }
+  
+  return sort keys %values;
+}
+
+#
+# ================================================================
+#
 
 my $timeout  = 10;
 my $lock_ext = ".lock";
@@ -932,13 +1010,16 @@ sub unlockf {
 }
 
 
-sub abort {
-  my ($self) = @_;
+sub _abort {
+  my ($self) = $_[0];
   unlockf (@locked_files);
-  _print_error("Aborting operation\n");
+  $mode{"silent"} = 0;
+  $self->_print_error(" +--------------------+");
+  $self->_print_error(" | ABORTING OPERATION |");
+  $self->_print_error(" +--------------------+");
 #  $self->{} = {};
 #  SAD::DESTROY();
-  exit;
+   exit;
 }
 
 sub DESTROY {
@@ -965,7 +1046,7 @@ sub write {
   # Check if record exists
   #
   if (! exists $self->{"data"}{$key}) {
-    _print_error ("No such record \'$key\' (write)!");
+    $self->_print_error ("No such record \'$key\' (write)!");
     return 0;
   }
 
@@ -993,14 +1074,14 @@ sub update {
   my $format = $self->{"fields"}{$val}{"options"}{"format"};
 
 
-  if ($self->{'config'}{'ro'}) {
-    _print_error ("Cannot change values.  Database $self->{'config'}{'file'} locked\n");
+  if ($self->is_readonly()) {
+    $self->_print_error ("Cannot change values.  Database $self->{'config'}{'file'} locked\n");
     return 0;
   };
 
   $format && do {
     if ($data !~ /$format/) {
-      _print_error ("WRONG FORMAT ($key: $datastring, $data) [$format]");
+      $self->_print_error ("WRONG FORMAT ($key: $datastring, $data) [$format]");
       return 0
     }
   };
@@ -1019,12 +1100,11 @@ sub update {
 sub delete_record {
   my ($self, $key) = @_;
 
-  if ($self->{'config'}{'ro'}) {
+  if ($self->is_readonly()) {
     _print_error ("Cannot delete keys.  Database $self->{'config'}{'file'} is read-only\n");
     return 0;
   };
 
-  $self->checkentry($key);
   delete $self->{"data"}{$key};
   $self->{"flags"}{$key}{"dirty"}   = 0;
   $self->{"flags"}{$key}{"deleted"} = 1;
@@ -1032,20 +1112,36 @@ sub delete_record {
   return 1;
 }
 
-
+#
+# commit -- commit db changes by writing them back to disk
+#
+#   WARNING: commit replaces all empty fields by $self->{'config'}{'noval'}
+#            and subsequent use of get() or other retrieval functions will
+#            return this value for empty fields and NOT an empty value
+#
+#   ***** THIS IS A BUG!! sorry *****
+#
 sub commit {
   my ($self) = @_;
-  my $log = 1;
+  my $log    = 1;
 
   my $rsep = $self->{'config'}{'recsep'};
 
   my $input   = $self->{'config'}{'file'};
-  my $output  = "$self->{'config'}{'file'}".".tmp";
+  my $output  = $self->{'config'}{'file'}.".tmp";
   my $logfile = $self->{'config'}{'logfile'};
 
-  die "Database $self->{'config'}{'file'} is READ-ONLY!\n"
-     if $self->{'config'}{'ro'};
-
+  if ($self->is_readonly()) {
+    $self->_print_error ("Database $self->{'config'}{'file'} is READ-ONLY!");
+    $self->_abort()
+  }
+  
+  if (!-w $self->{'config'}{'file'}) {
+    $self->_print_error ("Database file $self->{'config'}{'file'} is READ-ONLY!");
+    $self->_abort()
+  }
+  
+ 
   open (OUT, ">$output") || die "Unable to open database OUT ($output)!\n";
   open (IN, $input) || do {close(OUT); die "Unable to open database IN ($input)!\n"};
   if ($logfile && -e "$logfile") {
@@ -1086,24 +1182,25 @@ sub commit {
 }
 
   # log added records
-
+  #
   foreach my $key (keys %{$self->{"flags"}}) {
     if ($self->{"flags"}{$key}{"added"}) {
-      $log && _print_log(\*LOG, "Added Entry for key \'$key\'");
+      $log && _print_log(\*LOG, "Added Entry for key \'$key\' (".$self->{"flags"}{$key}{"added"}.")");
     }
   }
 
 
   # write back data
-
+  #
   foreach my $key (sort keys %{$self->{'data'}}) {
     if ($self->{"flags"}{$key}{"dirty"}) {
-       $log && _print_log(\*LOG, "Modified Data for key $key, ", $self->{"flags"}{$key}{"dirty"});
+       $log && _print_log(\*LOG, "Modified Data for key \'$key\' (" . $self->{"flags"}{$key}{"dirty"} . ")");
        $self->{"flags"}{$key}{"dirty"} = 0;  # clean "dirty" flag
     }
     foreach my $field (keys %{$self->{'fields'}}) {
-      if (! $self->{'data'}{$key}[$self->{"fields"}{$field}{"index"}]) {
-        $self->{'data'}{$key}[$self->{"fields"}{$field}{"index"}] = '-';
+      my $i = $self->{"fields"}{$field}{"index"};
+      if (! $self->{'data'}{$key}[$i]) {
+        $self->{'data'}{$key}[$i] = $self->{'config'}{'noval'};
       }
     }
     # now shift the array for printout (remember: our "real"
@@ -1163,15 +1260,42 @@ sub dumpconfig {
 }
 
 
+sub printdb {
+  my ($self, $key) = @_;
+
+  $| = 1;
+
+  print STDERR "Printing Keys ($key)\n";
+
+  if ($key) {
+    print STDERR $self->{"data"}{$key}[1], "\n";
+  } else {
+    foreach my $k (keys %{$self->{"data"}}) {
+      print STDERR "KEY: $k\n";
+    }
+  }
+
+  print STDERR "Formats\n\n";
+  foreach my $k (keys %{$self->{"format"}}) {
+    print STDERR "**", $k, "**\n";
+    print STDERR $self->{"format"}{$k};
+  }
+}
+
+
 #------------------------------
 
 
 sub _print_error {
-  my ($msg) = @_;
-  if ($silent) {
-    $error_messages .= "$msg\n"
+  my ($self, @msgs) = @_;
+  if ($mode{"silent"}) {
+    foreach my $msg (@msgs) {
+      $self->{'errormsgs'} .= "$msg\n"
+    }
   } else {
-    print STDERR "*** ERROR -- $msg\n";
+    foreach my $msg (@msgs) {
+      print STDERR "*** ERROR -- $msg\n";
+    }
   }
 }
 
@@ -1196,7 +1320,8 @@ sub isadmin {
 #
 sub AUTOLOAD {
   my ($self, @args) = @_;
-  my $AUTOLOAD =~ /::(\w+)$/;
+#  my $prog = $AUTOLOAD;
+  $AUTOLOAD =~ /::(\w+)$/;
   if (defined $self->{'data'}{$args[0]}) {
     return $self->get($args[0], $1)
   } else {
@@ -1211,8 +1336,143 @@ my $Interrupted = 0;   # to ensure it has a value
 $SIG{INT} = sub {
   $Interrupted++;
   syswrite(STDERR, "ouch\n", 5);
-  SAD::abort();
+  SAD::_abort();
 };
+
+
+
+1;
+
+###########################################################################
+#
+#   Package SAD::Shell
+#
+#
+#
+package SAD::Shell;
+use SAD;
+
+my $db = undef();
+
+my %commands = ('help'   => {'descr' => "Print this help",                          'cmd' => \&sad_help},
+                'load'   => {'descr' => "Load a database",                          'cmd' => \&load_db},
+                'addrec' => {'descr' => "Add a record to loaded database",          'cmd' => \&add_record},
+                'showrec'=> {'descr' => "Show a record from the loaded database",   'cmd' => \&show_record},
+                'chrec'  => {'descr' => "Change a record from the loaded database", 'cmd' => \&modify_record},
+                'setval' => {'descr' => "Change the value of a specific field",     'cmd' => undef()},
+                'commit' => {'descr' => "Commit all changes",                       'cmd' => undef()},
+                'dump'   => {'descr' => "Dump loaded database to STDOUT",           'cmd' => \&dump_db},
+                'search' => {'descr' => 'Search database',                          'cmd' => \&search_db},
+                'exit'   => {'descr' => "Exit SAD shell",                           'cmd' => \&exit_sadshell},
+               );
+
+my $prompt = "SAD> ";
+
+sub prompt {
+  my $message = $_[0];
+  print $prompt, $message;
+}
+
+sub shell {
+  print "This is the SAD shell for database XYZ\n";
+  prompt "Type a command or \"help\": ";
+  CMDLINE: while (<>) {
+    
+      my $cmdline = $_; chomp $cmdline;
+      my ($cmd, @options) = split (/ +/, $cmdline);
+      my $options = join(", ", @options);
+      defined $commands{$cmd} && do {
+        &{ $commands{$cmd}->{"cmd"} }($options);
+        next CMDLINE;
+      };
+        
+        do {
+          prompt "ERR -- Unknown command \"$cmd\", please try again\n";
+        };
+    
+  } continue {
+    prompt "Type a command or \"help\": ";
+ }
+  
+}
+
+sub load_db {
+  my $dbfile = $_[0];
+  if (!$dbfile) {
+    prompt "(load): Please enter the name of the databasefile: ";
+    $dbfile = <>; chomp $dbfile;
+  }
+  if (! -e $dbfile) {
+    print "ERR - No such file \"$dbfile\"\n";
+  } else {
+    print "Loading database from file \"$dbfile\"\n";
+    $db = SAD->new($dbfile);
+    if (!$db) {
+      print "ERR - Database load error happened!\n";
+    }
+  }
+}
+
+sub search_db {
+  if (!$db) {
+    print "ERR -- no database loaded yet.  Use \"load\" to load a database\n";
+  } else {
+    print "(query): Please enter a \"query\" compatible searchterm: ";
+    my $query = <>; chomp $query;
+    my ($field, $re) = split(/=/, $query);
+    my @keys = $db->search($field, $re);
+    print "Query results: \n";
+    foreach my $k (@keys) {
+      print "  * $k\n";
+    }
+  }
+
+  
+  
+}
+sub sad_help {
+  print "$prompt Available commands are:\n";
+  foreach my $c (sort keys %commands) {
+    print " * $c -- $commands{$c}->{'descr'}\n";
+  };
+}
+
+
+sub exit_sadshell {
+  $db->DESTROY() if $db;
+  print "Byebye, see you back soon :-)\n";
+  print "\n--\nThis was the SAD shell (c) Frank Thommen\n\n";
+  last CMDLINE
+}
+
+sub add_record {
+  if (!$db) {
+    print "ERR -- no database loaded yet.  Use \"load\" to load a database\n";
+  } else {
+    print "HELLO, this is addrec xxxxx\n"  
+  }
+}
+
+sub show_record {
+  if (!$db) {
+    print "ERR -- no database loaded yet.  Use \"load\" to load a database\n";
+  } else {
+     print "(showrec): Please enter a key: ";
+     my $k = <>; chomp($k);
+     my %rec = $db->get_record($k);
+     foreach my $f ($db->listfields()) {
+        print sprintf("%-15s%-s", $f.": ", $rec{$f}), "\n";
+     }
+  }
+}
+
+sub dump_db {
+  if (!$db) {
+    print "ERR -- no database loaded yet.  Use \"load\" to load a datbase\n";
+  } else {
+    $db->dumpconfig();  
+  }
+}
 
 
 1;
@@ -1224,12 +1484,10 @@ $SIG{INT} = sub {
 #
 #
 #
-
-
 package SAD::CGI;
 
 use SAD;
-use CGI;
+use CGI qw/*table/;
 use strict;
 
 
@@ -1237,16 +1495,16 @@ sub print_html_table {
   my ($self, $action) = @_;
   my $admin  = (($action eq 'admin') && $self->isadmin());
   my $color  = '';
-  my $title  = $self->{'web'}{'title'};
+  my $title  = $self->{'web'}{'title'}."::Overview";
   my $dbname = '';
 
-#  print "<p>PATH_INFO: $ENV{'PATH_INFO'}\n"; 
-#  print "<p>PATH_TRANSLATED: $ENV{'PATH_TRANSLATED'}\n";
-
-#  if ($admin && !$ENV{'REMOTE_USER'}) {
-#    print "<h1>You are not logged in</h1>";
-#    exit
-#  }
+  #  print "<p>PATH_INFO: $ENV{'PATH_INFO'}\n"; 
+  #  print "<p>PATH_TRANSLATED: $ENV{'PATH_TRANSLATED'}\n";
+  
+  #  if ($admin && !$ENV{'REMOTE_USER'}) {
+  #    print "<h1>You are not logged in</h1>";
+  #    exit
+  #  }
 
   if (CGI::param('db')) {
     $dbname = CGI::param('db');
@@ -1255,10 +1513,10 @@ sub print_html_table {
   if ($ENV{'PATH_INFO'}) {$dbname = ''};
 
   my $sortkey = CGI::param('sad_sortby');
-  $sortkey = $sortkey ? $sortkey : $self->{'fieldlist'}[1];
+     $sortkey = $sortkey ? $sortkey : $self->{'fieldlist'}[1];
 
   my $url = CGI::url(-path_info => 1, -query_string => 1);
-  $url = $url.'/'.$dbname if $dbname;
+     $url = $url.'/'.$dbname if $dbname;
 
   my @fieldlist = @{$self->{'fieldlist'}};
   shift @fieldlist;
@@ -1274,7 +1532,7 @@ sub print_html_table {
   my $nr_found = @all_keys;
 
   
-  my @all_keys = $self->listkeyssorted($sortkey, \@all_keys);
+  @all_keys = $self->listkeyssorted($sortkey, \@all_keys);
   my $tablewidth = $self->{'nrofields'}+1;
 
 
@@ -1290,7 +1548,7 @@ sub print_html_table {
     my $url = CGI::url(-path_info => 1);
     print "<a href=\"$url?sad_action=new\">Add new entry</a>\n";
   }
-  print "<p>Status: $action, ", $self->isadmin(), "\n";
+  print "<p>Status: $action, blah ", $self->isadmin(), "\n";
   print "<p>Last database modification: ".localtime((stat($self->{'config'}{'file'}))[9])."\n";
   print "<p>Logged in as ", $ENV{'REMOTE_USER'}, "\n";
   print "<p>Click on table headers to sort</p>\n";
@@ -1300,7 +1558,8 @@ sub print_html_table {
   #
   print CGI::start_form({method=>'get',action=>$url});
   print CGI::hidden('sad_sortby', $sortkey), "\n";;
-  print "<table border=\"0\">\n";
+  #print "<table border=\"0\">\n";
+  print start_table();
 
   print "<tr>\n  ";
   foreach my $head (@fieldlist) {
@@ -1325,8 +1584,9 @@ sub print_html_table {
 
   print CGI::end_form();
 
-  print "<tr><td class=\"noborder\" colspan=\"$tablewidth\">&nbsp;</td></tr>\n";
-  #  print "</table>\n";
+  # print "<tr><td class=\"noborder\" colspan=\"$tablewidth\">&nbsp;</td></tr>\n";
+  print "<tr><td colspan=\"$tablewidth\">&nbsp;</td></tr>\n";
+ #  print "</table>\n";
 
   #  print "<table border=\"0\">\n";
   print "<tr>\n  ";
@@ -1357,7 +1617,7 @@ sub print_html_table {
   # Table content
   #
   foreach my $key (@all_keys) {
-
+    
     foreach my $field (keys %{$self->{'fields'}}) {
       my $index = $self->{"fields"}{$field}{"index"};
       if (! $self->{'data'}{$key}[$index]) {
@@ -1395,7 +1655,8 @@ sub print_html_table {
     print join('</td><td>', @output_data);
     print "</td></tr>\n";
   }
-  print "</table>\n";
+  #print "</table>\n";
+  print end_table();
   print "<br>\n";
 
   print "</body>\n</html>\n";
@@ -1417,10 +1678,12 @@ database B<besides> the key field
 
 sub print_edit_form {
   my ($self, $key) = @_;
+  
   my @fieldlist = $self->listfields();
-  my $keyfield = $self->{'fieldlist'}[1];
-  my $title  = $self->{'web'}{'title'};
-  my $css = '<link href="/NMR-booking/booking.css" rel="stylesheet" type="text/css">';
+  my $keyfield  = $self->{'fieldlist'}[1];
+  my $title     = $self->{'web'}{'title'};
+  my $cssurl    = $self->{'web'}{'cssurl'};
+    my $css = $cssurl ? "<link href=\"$cssurl\" rel=\"stylesheet\" type=\"text/css\">" : "";
 
 
   print "<html>\n<head>\n<title>AAA$title</title>\n$css\n</head>\n<body>\n";
@@ -1456,9 +1719,11 @@ sub print_edit_form {
 
 sub print_submit_confirm {
   my ($self, $key) = @_;
+  
   my @fieldlist = @{$self->{'fieldlist'}}; shift @fieldlist;
-  my $title  = $self->{'web'}{'title'};
-  my $css = '<link href="/NMR-booking/booking.css" rel="stylesheet" type="text/css">';
+  my $title     = $self->{'web'}{'title'};
+  my $cssurl    = $self->{'web'}{'cssurl'};
+  my $css       = $cssurl ? "<link href=\"$cssurl\" rel=\"stylesheet\" type=\"text/css\">" : "";
 
   print "<html>\n<head>\n<title>$title</title>\n$css\n</head>\n<body>\n";
   print "<h1 align=\"center\">Confirm modifications</h1>\n";
@@ -1502,16 +1767,21 @@ Prints an input form for adding a new entry.
 
 
 sub print_new_entry_form {
-  my ($self) = @_;
+  # if $inline != 0, then it is assumed that the entry form is
+  # integrated into an already existing page
+  my ($self, $inline) = @_;
+  
   my @fieldlist = $self->listfields();
   my $keyfield  = $self->{'fieldlist'}[1];
-  my $css = '<link href="/NMR-booking/booking.css" rel="stylesheet" type="text/css">';
-  my $title  = $self->{'web'}{'title'};
+  my $title     = $self->{'web'}{'title'};
+  my $cssurl    = $self->{'web'}{'cssurl'};
+  my $css       = $cssurl ? "<link href=\"$cssurl\" rel=\"stylesheet\" type=\"text/css\">" : "";
 
-
-  print "<html>\n<head>\n<title>$title</title>\n$css\n</head>\n<body>\n";
+  if (!$inline) {
+    print "<html>\n<head>\n<title>$title</title>\n$css\n</head>\n<body>\n";
+  }
   print "<h2 align=\"center\">Adding new record to database</h2>\n";
-
+  
   print "<table border=\"1\">\n";
 
   print CGI::start_form({method=>'get'});
@@ -1526,10 +1796,13 @@ sub print_new_entry_form {
   }
 
   print "</table>\n";
-  print CGI::defaults();
+  print CGI::defaults("Cancel");
   print CGI::submit('sad_action', 'Add');
   print CGI::end_form();
 
+  if (!$inline) {
+    print CGI::end_html();
+  }
 }
 
 
@@ -1544,9 +1817,9 @@ CGI Dokumentation
 
 sub cgi {
   my ($db, $inline, $mode) = @_;
+    
   # $mode = 'user' if !isadmin();
-  my $dbname = '';
-  my $css = '<link href="/NMR-booking/booking.css" rel="stylesheet" type="text/css">';
+  my $dbname  = '';
 
   # Get the name of the database
   if (ref($db) eq 'HASH') {
@@ -1562,12 +1835,15 @@ sub cgi {
 
   # Any action pending?
   my $action = lc(CGI::param('sad_action'));
-  my $table  = SAD->new($db->{$dbname}, 'ro');
+  print "<html>DBNAME: $db->{$dbname}\n\n";
+  my $table  = SAD->new($db->{$dbname}, 'read-only,silent,permissive');
   $mode = 'user' if !$table->isadmin();
   
   my $title  = $table->{'web'}{'title'};
-  print "Content-Type: text/html\n\n";
-  print "<html>\n<head>\n<title>$title</title>\n$css\n</head>\n<body>\n";
+  my $cssurl = $table->{'web'}{'cssurl'};
+  my $css    = $cssurl ? "<link href=\"$cssurl\" rel=\"stylesheet\" type=\"text/css\">" : "";
+
+  print "<html>\n<head>\n<title>$title dddddd</title>\n$css\n</head>\n<body>\n";
 
   if ($action && !($mode eq 'admin')) {
     print "<h1>Not Admin, $action, $mode, $dbname</h1>\n";
@@ -1578,7 +1854,7 @@ sub cgi {
 
 
   #
-  # Delete entries
+  # DELETE entries
   #
   if ($action eq 'delete') {
     if (!CGI::param('sad_delkey')) {
@@ -1586,7 +1862,7 @@ sub cgi {
     } else {
        print "<h2>Delete Key ".CGI::param('sasd_delkey')."</h2>\n";
 
-       my $table  = SAD->new($db->{$dbname});
+       my $table  = SAD->new($db->{$dbname}, 'read-write,silent,permissive');
        $table->delete_record(CGI::param('sad_delkey'));
        $table->commit;
     }
@@ -1594,16 +1870,16 @@ sub cgi {
 
 
   #
-  # Add new entries
+  # ADD new entries
   #
   if ($action eq 'new') {
-    my $table = SAD->new($db->{$dbname}, 'ro');
-    $table->SAD::CGI::print_new_entry_form();
+    my $table = SAD->new($db->{$dbname}, 'read-only,silent,permissive');
+    $table->SAD::CGI::print_new_entry_form(1);
     return
   }
 
   if ($action eq 'add') {
-    my $table = SAD->new($db->{$dbname}, 'silent');
+    my $table = SAD->new($db->{$dbname}, 'read-write,silent,permissive');
 
     my $keyfield = $table->{'fieldlist'}[1];
     my $key = CGI::param($keyfield);
@@ -1616,8 +1892,9 @@ sub cgi {
     my $res = $table->add_record($key, %new_record);
       if (!$res) {
         print "<h1>ERROR Adding Record:</h1>\n";
-        print "<pre>$SAD::error_messages</pre>\n";
-        $table->abort();
+        print "<pre>$error_messages</pre>\n";
+        $table->SAD::CGI::print_new_entry_form(1);
+        # $table->_abort();
       } else {
         $table->commit();
       }  
@@ -1628,14 +1905,14 @@ sub cgi {
 
 
   #
-  # Edit records
+  # EDIT existing records
   #
   if ($action eq 'edit') {
     if (!CGI::param('sad_editkey')) {
       print "<h2>No Edit Key given</h2>\n";
       return;
     } else {
-       my $table = SAD->new($db->{$dbname}, "ro");
+       my $table = SAD->new($db->{$dbname}, 'read-only,silent,permissive');
        $table->SAD::CGI::print_edit_form(CGI::param('sad_editkey'));
        return
     }
@@ -1643,20 +1920,20 @@ sub cgi {
 
   if ($action eq 'submit') {
     print "<h1 align=\"center\">Submitting</h1>\n";
-    my $table = SAD->new($db->{$dbname}, 'ro');
+    my $table = SAD->new($db->{$dbname}, 'read-only,silent,permissive');
     print "DBNAME: $db, $dbname, ", $db->{$dbname}, "-\n";
     print "FIELDS: ", $table->{'nrofields'}, "-\n";
     my $key = $table->{'fieldlist'}[1];
-      $key = $table->$key(CGI::param($key));
+       $key = $table->$key(CGI::param($key));
     $table->SAD::CGI::print_submit_confirm($key);
     exit;
   }
 
   if ($action eq 'really submit') {
     print "<h1 align=\"center\">Submitting</h1>\n";
-    my $table = SAD->new($db->{$dbname}, 'silent');
+    my $table    = SAD->new($db->{$dbname}, 'silent,permissive');
     my $keyfield = $table->{'fieldlist'}[1];
-    my $key = $table->$keyfield(CGI::param($keyfield));
+    my $key      = $table->$keyfield(CGI::param($keyfield));
 
     foreach my $field ($table->listfields()) {
       my $res = $table->set($key, $field, CGI::param($field));
@@ -1668,14 +1945,16 @@ sub cgi {
     }
     $table->commit();
     CGI::delete_all();
-    # $table->abort();
+    # $table->_abort();
     $table->SAD::CGI::print_html_table($mode);
     exit;
   }
 
-  # Show the database
+  #
+  # SHOW the database
+  #
   if ($dbname) {
-    my $table  = SAD->new($db->{$dbname}, 'ro');
+    my $table  = SAD->new($db->{$dbname}, 'read-only,silent,permissive');
     $table->SAD::CGI::print_html_table($mode);
   } else {
    print "Content-Type: text/html\n\n";
